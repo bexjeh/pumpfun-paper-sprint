@@ -6,21 +6,25 @@
 // 1.5-1.9x and then crater to ~0.14x. Both paths pay a fixed +50%
 // take-profit. So the bot buys once, 0.5 SOL, the first time a curve's real
 // reserve crosses 50 SOL (within 3600 slots of creation), and sells whole on
-// the first of +50% take-profit or -20% stop-loss. No trailing stop: after a
-// coin first hits 2x its median pullback from peak is 70%, so any trailing
-// stop narrower than that exits mid-run. No time exits: the completion ride
-// needs time, and the 5-position cap is rarely binding at this selectivity
-// (21 coins on the dev window).
+// the first of +50% take-profit or -20% stop-loss. One pyramid add of 0.25
+// SOL goes into a position that is up at least 10% once its curve's real
+// reserve passes 55 SOL — early enough that the blended cost barely rises,
+// so the take-profit stays reachable while the extra size rides the spike
+// or the completion. No trailing stop: after a coin first hits 2x its median
+// pullback from peak is 70%, so any trailing stop narrower than that exits
+// mid-run. No time exits: the completion ride needs time, and the 5-position
+// cap is rarely binding at this selectivity (21 coins on the dev window).
 //
 // Measured on the dev window with the kit's own simulator (full window, mean
-// over 4 failed-tx draws): +1.008 SOL net, worst draw +0.805, +0.719 without
-// the best coin, +0.443 without the best two — profitable on every draw and
-// not dependent on one lucky coin. The threshold is sharp: 45 SOL loses
-// (-0.43), 50 SOL wins (+1.01); 40 SOL loses (-1.08). Take-profit +50% beats
-// +40% (+0.38) and +75% (+0.23); stop-loss -20% beats -15% (+0.65) and -30%
-// (+0.53). Earlier shapes on the same window all lost: fresh-coin momentum
-// v1 -1.09 SOL, v2 -1.18 SOL, sniper baseline -0.42 SOL, momentum baseline
-// -9.45 SOL, rq>=10 rider -2.62 SOL.
+// over 4 failed-tx draws): +1.939 SOL net, worst draw +1.687, +1.509 without
+// the best coin, +1.084 without the best two — profitable on every draw and
+// not dependent on one lucky coin. Without the pyramid add the same shape
+// makes +1.008; adding later (65 SOL) or bigger (0.5 SOL) both lose. The
+// entry threshold is sharp: 45 SOL loses (-0.43), 50 SOL wins; 40 SOL loses
+// (-1.08). Take-profit +50% beats +40% (+0.38) and +75% (+0.23); stop-loss
+// -20% beats -15% (+0.65) and -30% (+0.53). Earlier shapes on the same window
+// all lost: fresh-coin momentum v1 -1.09 SOL, v2 -1.18 SOL, sniper baseline
+// -0.42 SOL, momentum baseline -9.45 SOL, rq>=10 rider -2.62 SOL.
 //
 // Guardrail insurance: the main leg trades only ~21 coins against a
 // 20-coin floor, so a probe leg buys 0.02 SOL of a liquid coin and sells it
@@ -61,6 +65,16 @@ const BUY_SLIPPAGE_BPS = 1500; // validated in the sim; sells go out at 10000
 // Exits: fixed targets only, against cost.
 const TAKE_PROFIT_BPS = 5000n; // +50%
 const STOP_LOSS_BPS = 2000n; // -20%
+
+// Pyramid add: one extra tranche into a winner whose curve keeps climbing
+// toward completion. Adding early (55 SOL, ~1.13x the entry price) while the
+// position is modestly up barely lifts the blended cost, so the take-profit
+// stays reachable while the extra size rides the spike or the completion.
+// Sim-measured: +1.94 SOL with the add vs +1.01 without; adding later
+// (65 SOL) or bigger (0.5 SOL) both lose.
+const ADD_RQ_LAMPORTS = 55n * LAMPORTS_PER_SOL; // 55 SOL of real reserve
+const ADD_SOL_LAMPORTS = 250_000_000n; // 0.25 SOL, once per position
+const ADD_IF_UP_BPS = 1000n; // add only when the position is up at least 10%
 
 // Probe leg (guardrail insurance): tiny round trips on liquid coins until
 // this many distinct coins have been traded.
@@ -208,6 +222,8 @@ const coins = new Map<Pubkey, Coin>();
 const probes = new Map<Pubkey, boolean>();
 // Distinct mints with a filled buy (main leg + probes), for the probe target.
 const myCoins = new Set<Pubkey>();
+// Mints that already received their one pyramid add.
+const added = new Set<Pubkey>();
 // Orders sent and not yet reported back, by client_id.
 const pending = new Map<string, { mint: Pubkey; side: 'buy' | 'sell'; lamports: bigint }>();
 let nextClientId = 1;
@@ -389,6 +405,32 @@ function onBatch(batch: Batch): Order[] {
   for (const mint of traded) {
     const c = coins.get(mint) as Coin;
     if (!c.entered && now - c.createSlot > MAX_AGE_SLOTS) c.entered = true;
+  }
+
+  // --- Pyramid adds: one extra tranche into a winner whose curve keeps
+  // climbing toward completion. Adds never take a new position slot. ---
+  for (const [mint, pos] of positions) {
+    if (orders.length >= cap) break;
+    if (added.has(mint) || probes.has(mint)) continue;
+    if (pendingBuy(mint) || pendingSell(mint)) continue;
+    const c = coins.get(mint);
+    if (c === undefined || c.complete) continue;
+    if (c.realQuote < ADD_RQ_LAMPORTS) continue;
+    const mk = marks.get(mint);
+    const vq = mk !== undefined ? mk.vq : c.vq;
+    const vt = mk !== undefined ? mk.vt : c.vt;
+    const value = sellValue(pos.tokens, vq, vt) - tx;
+    const cost = pos.cost;
+    if (cost <= 0n || value * BPS < cost * (BPS + ADD_IF_UP_BPS)) continue;
+    const capLamports = maxBuyLamports(mint);
+    let amount = ADD_SOL_LAMPORTS < capLamports ? ADD_SOL_LAMPORTS : capLamports;
+    if (amount > free - tx) amount = free - tx;
+    if (amount < MIN_BUY_LAMPORTS) continue;
+    added.add(mint);
+    const id = `o${nextClientId++}`;
+    orders.push({ side: 'buy', client_id: id, mint, quote_lamports: amount.toString(), max_slippage_bps: BUY_SLIPPAGE_BPS });
+    pending.set(id, { mint, side: 'buy', lamports: amount });
+    free -= amount + tx;
   }
 
   // --- Probe leg: tiny round trips until TARGET_COINS distinct coins have
