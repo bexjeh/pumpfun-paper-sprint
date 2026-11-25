@@ -1,12 +1,23 @@
 // Pump.fun Paper Sprint bot — fresh-coin momentum with fast exits.
 //
-// Strategy: watch every bonding curve from its CreateEvent. Buy a coin once, soon after
-// launch, when its recent tape shows real buy pressure — net SOL flowing in, several
-// distinct buyers, price rising and sitting near its window high — and the creator has
-// not sold. One fixed stake per coin, never more than the open-position cap. Every
-// position exits whole on the first of: take-profit, stop-loss, a trailing stop once
-// the position is up, a max hold time, the creator selling, or the coin going stale.
-// Positions that complete are closed by the replay itself.
+// Strategy: watch every bonding curve from its CreateEvent. Buy a coin once, after it
+// has survived its first minute, when its recent tape shows real buy pressure — net
+// SOL flowing in, several distinct buyers, price rising and sitting near its window
+// high — and the creator has not sold. One fixed stake per coin, never more than the
+// open-position cap. Every position exits whole on the first of: stop-loss, a
+// trailing stop once the position is up, a max hold time that only bites while the
+// position is down, the creator selling, or the coin going stale. There is no fixed
+// take-profit: pump.fun returns are fat-tailed, so winners are left to run under the
+// trailing stop instead of being capped. Positions that complete are closed by the
+// replay itself.
+//
+// Revision (measured on the dev window): the first build capped winners at +20%
+// while taking -15% losses and lost -1.09 SOL over 307 coins at a 29% win rate.
+// The pilot baseline's swept parameters agree — no take-profit, trailing stop only,
+// stricter entry, a minimum coin age. This revision adopts that shape: no fixed
+// take-profit, trailing arm +5% / trail 30%, stop-loss -20%, entry only after 60
+// slots with stronger buy pressure, and the max-hold exit skipped while a position
+// is up.
 //
 // Deterministic by construction: every decision comes from the replayed event stream
 // and fixed constants. No clock, no randomness, no environment, no network. Iteration
@@ -29,12 +40,12 @@ const MAX_SLIPPAGE_BPS = 10_000;
 
 // Entry: the tape window and what it must show.
 const WINDOW_SLOTS = 60;
-const MIN_AGE_SLOTS = 2;
-const MAX_AGE_SLOTS = 300;
-const MIN_NET_SOL = 0.5; // net buy SOL (buys minus sells) over the window
+const MIN_AGE_SLOTS = 60;
+const MAX_AGE_SLOTS = 900;
+const MIN_NET_SOL = 1.0; // net buy SOL (buys minus sells) over the window
 const MIN_BUYS = 3; // buy trades in the window
-const MIN_BUYERS = 3; // distinct non-creator buyers in the window
-const MIN_PRICE_UP = 0.03; // price now vs window-start price, +3%
+const MIN_BUYERS = 5; // distinct non-creator buyers in the window
+const MIN_PRICE_UP = 0.05; // price now vs window-start price, +5%
 const NEAR_HIGH = 0.95; // price now at least 95% of the window high
 const MIN_REAL_SOL = 2; // real SOL reserve band at entry
 const MAX_REAL_SOL = 60;
@@ -44,11 +55,11 @@ const MAX_DEV_BUY_SOL = 2.5; // creator's own buys in the create slot, at most
 const STAKE_LAMPORTS = 100_000_000n; // 0.10 SOL
 const MIN_BUY_LAMPORTS = 20_000_000n; // 0.02 SOL
 
-// Exits (bps against cost, or slots held).
-const TAKE_PROFIT_BPS = 2000n; // +20%
-const STOP_LOSS_BPS = 1500n; // -15%
-const TRAIL_ARM_BPS = 1000n; // trailing stop arms once up 10%
-const TRAIL_BPS = 2500n; // ... then exits on a 25% fall from the peak value
+// Exits (bps against cost, or slots held). No fixed take-profit: winners run
+// under the trailing stop; the max-hold exit only bites while a position is down.
+const STOP_LOSS_BPS = 2000n; // -20%
+const TRAIL_ARM_BPS = 500n; // trailing stop arms once up 5%
+const TRAIL_BPS = 3000n; // ... then exits on a 30% fall from the peak value
 const MAX_HOLD_SLOTS = 1500; // ~10 minutes
 const STALE_SLOTS = 600; // no trade for this long: exit
 
@@ -411,7 +422,6 @@ function onBatch(batch: Batch): Order[] {
     if (value > hd.peakValue) hd.peakValue = value;
     let exit = false;
     if (cost > 0n) {
-      if (value * BPS >= cost * (BPS + TAKE_PROFIT_BPS)) exit = true; // take profit
       if (value * BPS <= cost * (BPS - STOP_LOSS_BPS)) exit = true; // stop loss
       if (
         hd.peakValue * BPS >= cost * (BPS + TRAIL_ARM_BPS) &&
@@ -420,7 +430,8 @@ function onBatch(batch: Batch): Order[] {
         exit = true; // trailing stop
       }
     }
-    if (now - hd.openedSlot >= MAX_HOLD_SLOTS) exit = true; // time limit
+    // Time limit bites only while the position is down: never cut a winner on time.
+    if (now - hd.openedSlot >= MAX_HOLD_SLOTS && value < cost) exit = true;
     if (c !== undefined) {
       if (c.devSold && !hd.devSoldAtOpen) exit = true; // creator sold: leave
       if (now - c.lastTradeSlot >= STALE_SLOTS) exit = true; // gone quiet
@@ -441,12 +452,13 @@ function onBatch(batch: Batch): Order[] {
     if (c.entered || c.complete) continue;
     if (positions.has(mint) || pendingBuy(mint)) continue;
     if (!entrySignal(c, now)) continue;
-    // First buy is also the last chance: a coin past its entry age is decided for good.
-    c.entered = true;
     const capLamports = maxBuyLamports(mint);
     let amount = STAKE_LAMPORTS < capLamports ? STAKE_LAMPORTS : capLamports;
     if (amount > free - tx) amount = free - tx;
     if (amount < MIN_BUY_LAMPORTS) continue;
+    // Only mark the coin entered once its buy is actually placed: an undersized
+    // buy leaves the coin eligible for a later batch, when its reserve may be bigger.
+    c.entered = true;
     const id = `o${nextClientId++}`;
     orders.push({ side: 'buy', client_id: id, mint, quote_lamports: amount.toString(), max_slippage_bps: MAX_SLIPPAGE_BPS });
     pending.set(id, { mint, side: 'buy', lamports: amount });
